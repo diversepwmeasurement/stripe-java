@@ -1,223 +1,226 @@
-name: CI
-
-on:
-  workflow_dispatch: {}
-  push:
-    branches:
-      - master
-      - beta
-      - sdk-release/**
-      - feature/**
-    tags:
-      - v[0-9]+.[0-9]+.[0-9]+*
-  pull_request:
-    branches:
-      - master
-      - beta
-      - sdk-release/**
-      - feature/**
-
 jobs:
   build:
     name: Build
-
-    runs-on: ubuntu-latest
-
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@master
+    - continue-on-error: true
+      uses: actions/checkout@master
+    - continue-on-error: true
+      id: setup-jre
+      name: Setup Java
+      uses: actions/setup-java@v1
+      with:
+        architecture: x64
+        java-version: '17'
+    - continue-on-error: true
+      name: Set Test Java Runtime Environment variable
+      run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
+    - continue-on-error: true
+      name: Spotless
+      run: ./gradlew spotlessCheck
+    - continue-on-error: true
+      name: Build artifacts
+      run: ./gradlew assemble javadoc
+  compat:
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      name: Checkout repository
+      uses: actions/checkout@v2
+    - continue-on-error: true
+      id: setup-jre
+      name: Setup Java
+      uses: actions/setup-java@v1
+      with:
+        architecture: x64
+        java-version: '17'
+    - continue-on-error: true
+      name: Set Test Java Runtime Environment variable
+      run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
+    - continue-on-error: true
+      name: Clone japi-compliance-checker
+      run: 'git clone https://github.com/lvc/japi-compliance-checker ../japi-compliance-checker
 
-      - name: Setup Java
-        id: setup-jre
-        uses: actions/setup-java@v1
-        with:
-          java-version: "17" # always use 17 LTS for building
-          architecture: x64
+        '
+    - continue-on-error: true
+      name: Build HEAD JAR file
+      run: ./gradlew jar
+    - continue-on-error: true
+      name: Copy JAR to japi-compliance-checker
+      run: 'mv build/libs/*.jar ../japi-compliance-checker/new.jar
 
-      - name: Set Test Java Runtime Environment variable
-        run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
+        '
+    - continue-on-error: true
+      name: Checkout base branch
+      uses: actions/checkout@v2
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+    - continue-on-error: true
+      name: Build Base JAR file
+      run: ./gradlew jar
+    - continue-on-error: true
+      name: Copy JAR to japi-compliance-checker
+      run: 'mv build/libs/*.jar ../japi-compliance-checker/old.jar
 
-      - name: Spotless
-        run: ./gradlew spotlessCheck
+        '
+    - continue-on-error: true
+      name: Run JAPI Compliance Checker
+      run: 'pushd ../japi-compliance-checker
 
-      - name: Build artifacts
-        run: ./gradlew assemble javadoc
+        perl japi-compliance-checker.pl -old old.jar -new new.jar --lib=stripe-java
+        || echo "failed" > compliance_failure
 
+        popd
+
+        mv ../japi-compliance-checker/compat_reports/stripe-java/*/compat_report.html
+        report.html
+
+        '
+    - continue-on-error: true
+      name: Upload report as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: JAPI Compliance Report
+        path: report.html
+    - continue-on-error: true
+      name: Fail if compatibility problems exist
+      run: "if [ -f \"../japi-compliance-checker/compliance_failure\" ]; then\n  echo\
+        \ \"There were compatibility problems. See the generated report at https://github.com/${{\
+        \ github.repository }}/actions/runs/${{ github.run_id }}#artifacts\"\n  exit\
+        \ 1\nfi\n"
+  publish:
+    if: ((github.event_name == 'workflow_dispatch') || (github.event_name == 'push'))
+      && startsWith(github.ref, 'refs/tags/v') && endsWith(github.actor, '-stripe')
+    needs:
+    - build
+    - test
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      uses: actions/checkout@master
+    - continue-on-error: true
+      id: setup-jre
+      name: Setup Java
+      uses: actions/setup-java@v1
+      with:
+        architecture: x64
+        java-version: '17'
+    - continue-on-error: true
+      name: Set Test Java Runtime Environment variable
+      run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
+    - continue-on-error: true
+      env:
+        GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        GPG_SIGNING_PRIVKEY: ${{ secrets.GPG_SIGNING_PRIVKEY }}
+      name: Configure GPG Key
+      run: 'set -ex
+
+        echo $GPG_SIGNING_PRIVKEY | base64 --decode | gpg --import --batch --yes --pinentry-mode
+        loopback --passphrase "$GPG_SIGNING_PASSPHRASE"
+
+        '
+    - continue-on-error: true
+      env:
+        GPG_SIGNING_KEYID: ${{ secrets.GPG_SIGNING_KEYID }}
+        GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
+        NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+      name: Publish package
+      run: './gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -Dorg.gradle.project.NEXUS_USERNAME=$NEXUS_USERNAME
+        -Dorg.gradle.project.NEXUS_PASSWORD=$NEXUS_PASSWORD -Dorg.gradle.project.signing.gnupg.keyName=$GPG_SIGNING_KEYID
+        -Dorg.gradle.project.signing.gnupg.passphrase=$GPG_SIGNING_PASSPHRASE
+
+        '
+    - continue-on-error: true
+      if: always()
+      uses: stripe/openapi/actions/notify-release@master
+      with:
+        bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
+  publish-docs:
+    if: ((github.event_name == 'workflow_dispatch') || (github.event_name == 'push'))
+      && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, 'beta') &&
+      endsWith(github.actor, '-stripe')
+    needs:
+    - build
+    - test
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      uses: actions/checkout@master
+    - continue-on-error: true
+      id: setup-jre
+      name: Setup Java
+      uses: actions/setup-java@v1
+      with:
+        architecture: x64
+        java-version: '17'
+    - continue-on-error: true
+      name: Set Test Java Runtime Environment variable
+      run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
+    - continue-on-error: true
+      env:
+        GRGIT_PASS: ${{ secrets.GITHUB_TOKEN }}
+        GRGIT_USER: ${{ github.actor }}
+      name: Publish Javadoc
+      run: './gradlew gitPublishPush --stacktrace --info
+
+        '
   test:
     name: Test
+    runs-on: self-hosted
+    steps:
+    - continue-on-error: true
+      uses: actions/checkout@master
+    - continue-on-error: true
+      id: setup-test-jre
+      name: Setup Test Java Runtime
+      uses: actions/setup-java@v1
+      with:
+        architecture: x64
+        java-version: ${{ matrix.java-version }}
+    - continue-on-error: true
+      name: Set Test Java Runtime Environment variable
+      run: echo "JAVA_TEST_HOME=${{ steps.setup-test-jre.outputs.path }}" >> $GITHUB_ENV
+    - continue-on-error: true
+      name: Setup Java
+      uses: actions/setup-java@v1
+      with:
+        architecture: x64
+        java-version: '17'
+    - continue-on-error: true
+      if: ${{ matrix.java-version == '1.8' }}
+      name: Tweak gradle.properties for Java 1.8
+      run: sed -e '/--add-exports/ s/^#*/#/' -i gradle.properties
+    - continue-on-error: true
+      name: Display version
+      run: './gradlew --version
 
-    runs-on: ubuntu-latest
+        echo "JAVA_TEST_HOME=$JAVA_TEST_HOME"
 
+        '
+    - continue-on-error: true
+      uses: stripe/openapi/actions/stripe-mock@master
+    - continue-on-error: true
+      name: Run test suite
+      run: make ci-test
+    - continue-on-error: true
+      env:
+        CI_NAME: github-actions
+        COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+      if: env.COVERALLS_REPO_TOKEN && matrix.java-version == '17'
+      name: Send code coverage report to coveralls.io
+      run: ./gradlew jacocoTestReport coveralls
     strategy:
       fail-fast: false
       matrix:
         java-version:
-          - "1.8"
-          - "11"
-          - "17"
-          - "18"
-          - "19"
-          - "20"
-
-    steps:
-      - uses: actions/checkout@master
-
-      - name: Setup Test Java Runtime
-        id: setup-test-jre
-        uses: actions/setup-java@v1
-        with:
-          java-version: ${{ matrix.java-version }}
-          architecture: x64
-
-      - name: Set Test Java Runtime Environment variable
-        run: echo "JAVA_TEST_HOME=${{ steps.setup-test-jre.outputs.path }}" >> $GITHUB_ENV
-
-      - name: Setup Java
-        uses: actions/setup-java@v1
-        with:
-          java-version: "17" # always use 17 LTS for building
-          architecture: x64
-
-      - name: Tweak gradle.properties for Java 1.8
-        if: ${{ matrix.java-version == '1.8' }}
-        run: sed -e '/--add-exports/ s/^#*/#/' -i gradle.properties
-
-      - name: Display version
-        run: |
-          ./gradlew --version
-          echo "JAVA_TEST_HOME=$JAVA_TEST_HOME"
-
-      - uses: stripe/openapi/actions/stripe-mock@master
-      - name: Run test suite
-        run: make ci-test
-
-      - name: Send code coverage report to coveralls.io
-        run: ./gradlew jacocoTestReport coveralls
-        if: env.COVERALLS_REPO_TOKEN && matrix.java-version == '17'
-        env:
-          CI_NAME: github-actions
-          COVERALLS_REPO_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
-
-  publish:
-    if: >-
-        ((github.event_name == 'workflow_dispatch') || (github.event_name == 'push')) &&
-        startsWith(github.ref, 'refs/tags/v') &&
-        endsWith(github.actor, '-stripe')
-    needs: [build, test]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@master
-      - name: Setup Java
-        id: setup-jre
-        uses: actions/setup-java@v1
-        with:
-          java-version: "17" # always use 17 LTS for building
-          architecture: x64
-      - name: Set Test Java Runtime Environment variable
-        run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
-
-      - name: Configure GPG Key
-        run: |
-          set -ex
-          echo $GPG_SIGNING_PRIVKEY | base64 --decode | gpg --import --batch --yes --pinentry-mode loopback --passphrase "$GPG_SIGNING_PASSPHRASE"
-        env:
-          GPG_SIGNING_PRIVKEY: ${{ secrets.GPG_SIGNING_PRIVKEY }}
-          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
-
-      - name: Publish package
-        run: |
-          ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -Dorg.gradle.project.NEXUS_USERNAME=$NEXUS_USERNAME -Dorg.gradle.project.NEXUS_PASSWORD=$NEXUS_PASSWORD -Dorg.gradle.project.signing.gnupg.keyName=$GPG_SIGNING_KEYID -Dorg.gradle.project.signing.gnupg.passphrase=$GPG_SIGNING_PASSPHRASE
-        env:
-          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-          GPG_SIGNING_KEYID: ${{ secrets.GPG_SIGNING_KEYID }}
-          GPG_SIGNING_PASSPHRASE: ${{ secrets.GPG_SIGNING_PASSPHRASE }}
-      - uses: stripe/openapi/actions/notify-release@master
-        if: always()
-        with:
-          bot_token: ${{ secrets.SLACK_BOT_TOKEN }}
-
-  publish-docs:
-    if: >-
-      ((github.event_name == 'workflow_dispatch') || (github.event_name == 'push')) &&
-      startsWith(github.ref, 'refs/tags/v') &&
-      !contains(github.ref, 'beta') &&
-      endsWith(github.actor, '-stripe')
-    needs: [build, test]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@master
-      - name: Setup Java
-        id: setup-jre
-        uses: actions/setup-java@v1
-        with:
-          java-version: "17" # always use 17 TLS for building
-          architecture: x64
-      - name: Set Test Java Runtime Environment variable
-        run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
-
-      - name: Publish Javadoc
-        run: |
-          ./gradlew gitPublishPush --stacktrace --info
-        env:
-          GRGIT_USER: ${{ github.actor }}
-          GRGIT_PASS: ${{ secrets.GITHUB_TOKEN }}
-
-  compat:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v2
-
-      - name: Setup Java
-        id: setup-jre
-        uses: actions/setup-java@v1
-        with:
-          java-version: "17" # always use 17 TLS for building
-          architecture: x64
-
-      - name: Set Test Java Runtime Environment variable
-        run: echo "JAVA_TEST_HOME=${{ steps.setup-jre.outputs.path }}" >> $GITHUB_ENV
-
-      - name: Clone japi-compliance-checker
-        run: |
-          git clone https://github.com/lvc/japi-compliance-checker ../japi-compliance-checker
-
-      - name: Build HEAD JAR file
-        run: ./gradlew jar
-
-      - name: Copy JAR to japi-compliance-checker
-        run: |
-          mv build/libs/*.jar ../japi-compliance-checker/new.jar
-
-      - name: Checkout base branch
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-
-      - name: Build Base JAR file
-        run: ./gradlew jar
-
-      - name: Copy JAR to japi-compliance-checker
-        run: |
-          mv build/libs/*.jar ../japi-compliance-checker/old.jar
-
-      - name: Run JAPI Compliance Checker
-        run: |
-          pushd ../japi-compliance-checker
-          perl japi-compliance-checker.pl -old old.jar -new new.jar --lib=stripe-java || echo "failed" > compliance_failure
-          popd
-          mv ../japi-compliance-checker/compat_reports/stripe-java/*/compat_report.html report.html
-
-      - name: Upload report as artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: JAPI Compliance Report
-          path: report.html
-
-      - name: Fail if compatibility problems exist
-        run: |
-          if [ -f "../japi-compliance-checker/compliance_failure" ]; then
-            echo "There were compatibility problems. See the generated report at https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
-            exit 1
-          fi
+        - '1.8'
+        - '11'
+        - '17'
+        - '18'
+        - '19'
+        - '20'
+name: CI
+on:
+  repository_dispatch:
+    types: trigger-ga___ci.yml
